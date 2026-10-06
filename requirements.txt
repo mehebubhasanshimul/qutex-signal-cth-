@@ -2,8 +2,3 @@ python-telegram-bot>=20.0
 pandas
 numpy
 scipy
-websockets
-aiohttp
-curl_cffi
-rich
-cryptography
