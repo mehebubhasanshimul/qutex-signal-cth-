@@ -44,7 +44,7 @@ async def auto_signal_engine():
             
             # ১. হাই-ডিজাইন প্রি-ট্রেড সিগন্যাল কার্ড
             signal_message = (
-                f"⚡ <b>FOREX TRADING SIGNAL ENGINE</b> ⚡\n"
+                f"⚡ <b>QUTEX TRADING SIGNAL ENGINE</b> ⚡\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📊 <b>Asset:</b> <code>{asset}</code>\n"
                 f"📈 <b>Prediction:</b> <b>{direction}</b>\n"
