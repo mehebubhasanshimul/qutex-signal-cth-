@@ -4,4 +4,3 @@ python-telegram-bot>=20.0
 pandas
 numpy
 yfinance
-scipy
