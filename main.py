@@ -8,7 +8,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import requests
 
 # Logging Setup
 logging.basicConfig(
@@ -22,6 +22,7 @@ app = Flask(__name__)
 # Credentials & Constants
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@qutexsignalcth")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 DEVELOPER_CREDIT = "@SHADOW_JOKER_CTH"
 PROJECT_NAME = "Qutex Signal CTH"
 
@@ -62,7 +63,7 @@ HTML_TEMPLATE = """
         .info-row:last-child { margin-bottom: 0; }
         .label { color: #94a3b8; }
         .value { color: #f8fafc; font-weight: 600; }
-        .error-text { color: #f87171; font-size: 12px; margin-top: 10px; text-align: center; }
+        .error-text { color: #f87171; font-size: 12px; margin-top: 10px; text-align: center; word-break: break-all; }
         .btn-group { display: flex; gap: 12px; }
         .btn { flex: 1; padding: 12px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; text-decoration: none; text-align: center; font-size: 14px; transition: 0.2s; }
         .btn-start { background-color: #16a34a; color: white; }
@@ -78,7 +79,7 @@ HTML_TEMPLATE = """
         <div class="subtitle">Developer: {{ developer }}</div>
         
         <div class="status-badge {{ 'running' if state.running else 'stopped' }}">
-            {{ '🟢 Engine Status: RUNNING (2-Min Expiry)' if state.running else '🔴 Engine Status: STOPPED' }}
+            {{ '🟢 Engine Status: RUNNING (RapidAPI Connected)' if state.running else '🔴 Engine Status: STOPPED' }}
         </div>
         
         <div class="info-box">
@@ -124,86 +125,88 @@ def control():
 
 def fetch_market_data():
     """
-    Yahoo Finance থেকে স্ট্রিক্ট রিয়েল-টাইম ডেটা ফেচ ও ভ্যালিডেশন।
-    সিন্থেটিক বা ফলস ডেটা জেনারেট করা সম্পূর্ণ নিষিদ্ধ।
+    RapidAPI YH Finance Chart Endpoint ব্যবহার করে EUR/USD লাইভ ডেটা ফেচ করা।
     """
     try:
-        data = yf.download(tickers="EURUSD=X", period="1d", interval="1m", progress=False)
-        if data is None or data.empty:
-            raise ValueError("Empty dataset received from data provider.")
-            
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.droplevel(1)
-            
-        required_cols = ['Open', 'High', 'Low', 'Close']
-        for col in required_cols:
-            if col not in data.columns:
-                raise ValueError(f"Missing required column: {col}")
-                
-        # ডেটা ক্লিনিং এবং ডুপ্লিকেট রিমুভাল
-        data = data.dropna(subset=required_cols)
-        data = data[~data.index.duplicated(keep='last')]
-        data = data.sort_index()
-        
-        if len(data) < 30:
-            raise ValueError("Insufficient candles available for analysis.")
-            
-        # ডেটা ফ্রেশনেস যাচাই (শেষ ক্যান্ডেলটি খুব পুরোনো কি না)
-        latest_time = data.index[-1]
-        now_utc = datetime.now(timezone.utc)
-        
-        # যদি টাইমজোন অ্যাওয়ার না থাকে তবে হ্যান্ডেল করা
-        if latest_time.tzinfo is None:
-            latest_time = latest_time.tz_localize('UTC')
-            
-        time_diff = (now_utc - latest_time).total_seconds()
-        if time_diff > 300: # ৫ মিনিটের বেশি পুরোনো হলে ওয়ার্নিং/বাতিল
-            logger.warning(f"Market data is stale. Last candle timestamp: {latest_time}")
-            
+        if not RAPIDAPI_KEY:
+            raise ValueError("RAPIDAPI_KEY is missing in environment variables.")
+
+        url = "https://yh-finance.p.rapidapi.com/stock/v2/get-chart"
+        querystring = {"symbol": "EURUSD=X", "interval": "1m", "range": "1d"}
+        headers = {
+            "X-RapidAPI-Key": RAPIDAPI_KEY,
+            "X-RapidAPI-Host": "yh-finance.p.rapidapi.com"
+        }
+
+        response = requests.get(url, headers=headers, params=querystring, timeout=15)
+        if response.status_code != 200:
+            raise ValueError(f"RapidAPI HTTP Error: {response.status_code}")
+
+        res_json = response.json()
+        result = res_json.get("chart", {}).get("result", [])
+        if not result:
+            raise ValueError("Invalid chart result structure from RapidAPI.")
+
+        data_res = result[0]
+        timestamps = data_res.get("timestamp", [])
+        indicators = data_res.get("indicators", {}).get("quote", [{}])[0]
+
+        if not timestamps or not indicators:
+            raise ValueError("Missing timestamps or quote indicators in API response.")
+
+        df = pd.DataFrame({
+            "Open": indicators.get("open", []),
+            "High": indicators.get("high", []),
+            "Low": indicators.get("low", []),
+            "Close": indicators.get("close", []),
+            "Volume": indicators.get("volume", [0] * len(timestamps))
+        }, index=pd.to_datetime(timestamps, unit="s", utc=True))
+
+        df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
+        df = df[~df.index.duplicated(keep='last')]
+        df = df.sort_index()
+
+        if len(df) < 30:
+            raise ValueError(f"Insufficient candles ({len(df)}). Need at least 30.")
+
+        latest_time = df.index[-1]
         with state_lock:
             engine_state["last_data_timestamp"] = str(latest_time)
-            
-        return data
+            engine_state["last_error"] = None
+
+        return df
     except Exception as e:
         err_msg = str(e)
-        logger.error(f"Data fetch error: {err_msg}")
+        logger.error(f"RapidAPI fetch error: {err_msg}")
         with state_lock:
             engine_state["last_error"] = err_msg
         return None
 
 def compute_indicators(df):
-    """
-    EMA 8, 21, RSI 14, MACD (12, 26, 9), Stochastic (%K, %D), ATR 14 ক্যালকুলেশন।
-    """
     close = df['Close']
     high = df['High']
     low = df['Low']
     
-    # EMA
     df['EMA_Fast'] = close.ewm(span=8, adjust=False).mean()
     df['EMA_Slow'] = close.ewm(span=21, adjust=False).mean()
     
-    # RSI 14
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # MACD 12, 26, 9
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df['MACD'] = ema12 - ema26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     
-    # Stochastic %K and %D
     low14 = low.rolling(window=14).min()
     high14 = high.rolling(window=14).max()
     df['Stoch_K'] = 100 * ((close - low14) / (high14 - low14 + 1e-10))
     df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
     
-    # ATR 14
     tr1 = high - low
     tr2 = (high - close.shift()).abs()
     tr3 = (low - close.shift()).abs()
@@ -213,23 +216,18 @@ def compute_indicators(df):
     return df.dropna()
 
 def leakage_free_backtest(df):
-    """
-    ভবিষ্যতের ডেটা লিকেজ এড়িয়ে ঐতিহাসিক ডেটার ওপর ব্যাকটেস্ট করে প্রকৃত পারফরম্যান্স ও স্যাম্পল কাউন্ট বের করা।
-    """
     if len(df) < 30:
         return 0.0, 0, 0, 0
         
     df_bt = df.copy()
     df_bt['Signal'] = 0
     
-    # কঠোর কনফ্লুয়েন্স শর্ত
     buy_cond = (df_bt['EMA_Fast'] > df_bt['EMA_Slow']) & (df_bt['RSI'] < 45) & (df_bt['MACD_Hist'] > 0) & (df_bt['Stoch_K'] < 30)
     sell_cond = (df_bt['EMA_Fast'] < df_bt['EMA_Slow']) & (df_bt['RSI'] > 55) & (df_bt['MACD_Hist'] < 0) & (df_bt['Stoch_K'] > 70)
     
     df_bt.loc[buy_cond, 'Signal'] = 1
     df_bt.loc[sell_cond, 'Signal'] = -1
     
-    # ২ মিনিটের এক্সপায়ারির জন্য শিফটিং (ফিউচার রিটার্ন)
     df_bt['Future_Return'] = df_bt['Close'].shift(-2) - df_bt['Close']
     
     executed = df_bt[df_bt['Signal'] != 0].dropna(subset=['Future_Return'])
@@ -248,16 +246,13 @@ def leakage_free_backtest(df):
     return round(win_rate, 1), total_samples, int(wins), int(losses)
 
 def generate_signal():
-    """
-    নিখুঁত অ্যানালাইসিস এবং স্কোরিং সিস্টেম। শর্ত পূরণ না হলে NO_SIGNAL রিটার্ন করবে।
-    """
     df = fetch_market_data()
     if df is None:
-        return None, "Data Unavailable"
+        return None, "RapidAPI Data Unavailable or Key Missing"
         
     df = compute_indicators(df)
     if df.empty:
-        return None, "Insufficient Clean Data"
+        return None, "Insufficient Clean Data after indicators"
         
     win_rate, sample_count, bt_wins, bt_losses = leakage_free_backtest(df)
     
@@ -270,7 +265,6 @@ def generate_signal():
     ema_fast = float(latest['EMA_Fast'])
     ema_slow = float(latest['EMA_Slow'])
     
-    # কনফ্লুয়েন্স স্কোরিং সিস্টেম
     score = 0
     if ema_fast > ema_slow: score += 2
     else: score -= 2
@@ -284,13 +278,12 @@ def generate_signal():
     if stoch_k < 35: score += 2
     elif stoch_k > 65: score -= 2
     
-    # কঠোর থ্রেশহোল্ড (নাহলে সিগন্যাল বাতিল)
     if score >= 4:
         direction = "CALL 🟢 (HIGHER)"
     elif score <= -4:
         direction = "PUT 🔴 (LOWER)"
     else:
-        return None, "NO SIGNAL (Market in consolidation / low confluence)"
+        return None, f"NO SIGNAL (Score: {score}/4 - Confluence not met)"
         
     analysis_text = (
         f"📊 <b>Technical Indicators:</b>\n"
@@ -307,9 +300,6 @@ def generate_signal():
     }, None
 
 def evaluate_settlement(entry_price, direction, df_future):
-    """
-    প্রকৃত সেটেলমেন্ট যাচাই: এক্সপায়ারি শেষে প্রাইজ চেক করা।
-    """
     try:
         if df_future is None or df_future.empty:
             return "UNKNOWN"
@@ -328,21 +318,16 @@ def evaluate_settlement(entry_price, direction, df_future):
     return "UNKNOWN"
 
 def background_engine():
-    """
-    ব্যাকগ্রাউন্ডে নিরাপদে সিগন্যাল জেনারেট এবং এক্সপায়ারি ট্র্যাক করার লুপ।
-    """
     global engine_state
-    logger.info("Background Signal Engine started.")
+    logger.info("Background Signal Engine started with RapidAPI.")
     
+    import time
     while True:
         try:
             with state_lock:
                 is_running = engine_state["running"]
                 
             if not is_running:
-                await_sleep = 5
-                # blocking sleep without async inside sync thread can use time.sleep
-                import time
                 time.sleep(5)
                 continue
                 
@@ -352,11 +337,10 @@ def background_engine():
                 logger.info(f"Signal skipped: {error_reason}")
                 with state_lock:
                     engine_state["last_error"] = error_reason
-                import time
-                time.sleep(60) # ডেটা না থাকলে ১ মিনিট অপেক্ষা
+                time.sleep(60)
                 continue
                 
-            asset = "EUR/USD (Live Market)"
+            asset = "EUR/USD (RapidAPI Live)"
             expiry = "2 Minutes"
             
             with state_lock:
@@ -380,7 +364,6 @@ def background_engine():
             
             if bot and TELEGRAM_CHAT_ID:
                 try:
-                    # Async loop runner for telegram bot
                     async def send_msg():
                         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=signal_msg, parse_mode="HTML")
                     asyncio.run(send_msg())
@@ -389,21 +372,19 @@ def background_engine():
                     with state_lock:
                         engine_state["last_error"] = f"Telegram Error: {te}"
             
-            # ২ মিনিট (১২০ সেকেন্ড) ট্রেড মেয়াদের জন্য অপেক্ষা
-            import time
+            # ২ মিনিট (১২০ সেকেন্ড) অপেক্ষা
             elapsed = 0
             while elapsed < 120:
                 with state_lock:
-                    if not engine_state["running"]:
+                    if not engine_running:
                         break
                 time.sleep(1)
                 elapsed += 1
                 
             with state_lock:
-                if not engine_state["running"]:
+                if not engine_running:
                     continue
                     
-            # সেটেলমেন্ট যাচাই
             future_df = fetch_market_data()
             result_status = evaluate_settlement(signal_data['price'], signal_data['direction'], future_df)
             
@@ -437,16 +418,14 @@ def background_engine():
                 except Exception as ex:
                     logger.error(f"Result notification error: {ex}")
                     
-            time.sleep(30) # পরবর্তী সিগন্যালের আগে বিরতি
+            time.sleep(30)
             
         except Exception as ex:
             logger.error(f"Critical error in background engine: {ex}")
             with state_lock:
                 engine_state["last_error"] = str(ex)
-            import time
             time.sleep(15)
 
-# Background Thread Launch (Single Worker architecture recommendation)
 if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or os.environ.get("RENDER"):
     engine_thread = threading.Thread(target=background_engine, daemon=True)
     engine_thread.start()
