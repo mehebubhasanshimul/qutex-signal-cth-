@@ -2,66 +2,104 @@ import os
 import logging
 import asyncio
 import threading
-from flask import Flask, render_template_string, redirect, url_for
+from datetime import datetime, timezone
+from flask import Flask, render_template_string, request, redirect, url_for
 from telegram import Bot
+from telegram.error import TelegramError
 import pandas as pd
 import numpy as np
 import yfinance as yf
 
-app = Flask(__name__)
-
+# Logging Setup
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+app = Flask(__name__)
+
+# Credentials & Constants
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@qutexsignalcth")
 DEVELOPER_CREDIT = "@SHADOW_JOKER_CTH"
+PROJECT_NAME = "Qutex Signal CTH"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
-# ইঞ্জিন চালু বা বন্ধ রাখার গ্লোবাল স্ট্যাটাস
-engine_running = True
+# Thread-Safe Global State
+engine_state = {
+    "running": True,
+    "last_signal": None,
+    "last_error": None,
+    "last_data_timestamp": "Not Available",
+    "active_signals_count": 0,
+    "total_signals": 0,
+    "wins": 0,
+    "losses": 0,
+    "draws": 0
+}
+state_lock = threading.Lock()
 
-# Start/Stop বাটনযুক্ত প্রফেশনাল ওয়েব ড্যাশবোর্ড
-HTML_PAGE = """
+# Professional Dark Dashboard HTML
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>QUTEX Real Market Analysis Engine</title>
+    <title>{{ project_name }} - Control Panel</title>
     <style>
-        body { background-color: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .card { background: #1e293b; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); width: 100%; max-width: 420px; text-align: center; border: 1px solid #334155; }
-        h1 { color: #38bdf8; font-size: 24px; margin-bottom: 10px; }
-        p { color: #94a3b8; font-size: 14px; margin-bottom: 25px; line-height: 1.6; }
-        .status-badge { padding: 10px 20px; border-radius: 8px; font-weight: bold; display: inline-block; margin-bottom: 20px; font-size: 14px; }
-        .running { background-color: #166534; color: #4ade80; }
+        body { background-color: #0b0f19; color: #f1f5f9; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .card { background: #1e293b; padding: 35px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.6); width: 100%; max-width: 480px; border: 1px solid #334155; }
+        h1 { color: #38bdf8; font-size: 22px; margin-bottom: 5px; text-align: center; }
+        .subtitle { text-align: center; color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+        .status-badge { padding: 8px 16px; border-radius: 6px; font-weight: bold; display: block; text-align: center; margin-bottom: 20px; font-size: 13px; }
+        .running { background-color: #065f46; color: #34d399; }
         .stopped { background-color: #7f1d1d; color: #fca5a5; }
-        .btn-group { display: flex; gap: 12px; justify-content: center; }
-        .btn { padding: 12px 24px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; text-decoration: none; font-size: 14px; transition: 0.2s; }
+        .info-box { background: #0f172a; padding: 15px; border-radius: 8px; font-size: 13px; margin-bottom: 20px; border: 1px solid #1e293b; }
+        .info-row { display: flex; justify-content: space-between; margin-bottom: 8px; }
+        .info-row:last-child { margin-bottom: 0; }
+        .label { color: #94a3b8; }
+        .value { color: #f8fafc; font-weight: 600; }
+        .error-text { color: #f87171; font-size: 12px; margin-top: 10px; text-align: center; }
+        .btn-group { display: flex; gap: 12px; }
+        .btn { flex: 1; padding: 12px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; text-decoration: none; text-align: center; font-size: 14px; transition: 0.2s; }
         .btn-start { background-color: #16a34a; color: white; }
         .btn-start:hover { background-color: #15803d; }
         .btn-stop { background-color: #dc2626; color: white; }
         .btn-stop:hover { background-color: #b91c1c; }
-        .footer { margin-top: 25px; font-size: 12px; color: #64748b; }
+        .footer { margin-top: 20px; text-align: center; font-size: 11px; color: #64748b; }
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>QUTEX Real Market Pro</h1>
-        <div class="status-badge {{ 'running' if is_running else 'stopped' }}">
-            {{ '🟢 Live Analysis Active (2-Min)' if is_running else '🔴 Engine Stopped' }}
+        <h1>{{ project_name }}</h1>
+        <div class="subtitle">Developer: {{ developer }}</div>
+        
+        <div class="status-badge {{ 'running' if state.running else 'stopped' }}">
+            {{ '🟢 Engine Status: RUNNING (2-Min Expiry)' if state.running else '🔴 Engine Status: STOPPED' }}
         </div>
-        <p>EUR/USD রিয়েল-টাইম OHLC ডেটা, মাল্টি-ইন্ডিকেটর কনফ্লুয়েন্স এবং কঠোর ব্যাকটেস্টিং ফিল্টার সক্রিয় রয়েছে।</p>
-        <div class="btn-group">
-            <a href="/start" class="btn btn-start">Start</a>
-            <a href="/stop" class="btn btn-stop">Stop</a>
+        
+        <div class="info-box">
+            <div class="info-row"><span class="label">Last Data Time:</span><span class="value">{{ state.last_data_timestamp }}</span></div>
+            <div class="info-row"><span class="label">Last Signal:</span><span class="value">{{ state.last_signal or 'None' }}</span></div>
+            <div class="info-row"><span class="label">Total Signals:</span><span class="value">{{ state.total_signals }}</span></div>
+            <div class="info-row"><span class="label">Wins / Losses / Draws:</span><span class="value">{{ state.wins }} / {{ state.losses }} / {{ state.draws }}</span></div>
         </div>
-        <div class="footer">Dev: @SHADOW_JOKER_CTH</div>
+        
+        {% if state.last_error %}
+        <div class="error-text">⚠️ Last Error: {{ state.last_error }}</div>
+        {% endif %}
+        
+        <form method="POST" action="/control" class="btn-group">
+            <input type="hidden" name="action" value="{{ 'stop' if state.running else 'start' }}">
+            <button type="submit" class="btn {{ 'btn-stop' if state.running else 'btn-start' }}">
+                {{ 'Stop Engine' if state.running else 'Start Engine' }}
+            </button>
+        </form>
+        
+        <div class="footer">Disclaimer: Binary options trading involves substantial risk. No guaranteed accuracy.</div>
     </div>
 </body>
 </html>
@@ -69,127 +107,159 @@ HTML_PAGE = """
 
 @app.route("/")
 def home():
-    return render_template_string(HTML_PAGE, is_running=engine_running)
+    with state_lock:
+        return render_template_string(HTML_TEMPLATE, project_name=PROJECT_NAME, developer=DEVELOPER_CREDIT, state=engine_state)
 
-@app.route("/start")
-def start_engine():
-    global engine_running
-    engine_running = True
-    logger.info("ইউজার ওয়েব প্যানেল থেকে ইঞ্জিন চালু করেছেন।")
+@app.route("/control", methods=["POST"])
+def control():
+    action = request.form.get("action")
+    with state_lock:
+        if action == "start":
+            engine_state["running"] = True
+            logger.info("Engine started via Web Control Panel.")
+        elif action == "stop":
+            engine_state["running"] = False
+            logger.info("Engine stopped via Web Control Panel.")
     return redirect(url_for('home'))
 
-@app.route("/stop")
-def stop_engine():
-    global engine_running
-    engine_running = False
-    logger.info("ইউজার ওয়েব প্যানেল থেকে ইঞ্জিন বন্ধ করেছেন।")
-    return redirect(url_for('home'))
-
-def fetch_strict_real_data():
+def fetch_market_data():
     """
-    Yahoo Finance থেকে EUR/USD এর লেটেস্ট লাইভ OHLC ডেটা ফেচ এবং ফ্রেশনেস চেক
+    Yahoo Finance থেকে স্ট্রিক্ট রিয়েল-টাইম ডেটা ফেচ ও ভ্যালিডেশন।
+    সিন্থেটিক বা ফলস ডেটা জেনারেট করা সম্পূর্ণ নিষিদ্ধ।
     """
     try:
         data = yf.download(tickers="EURUSD=X", period="1d", interval="1m", progress=False)
-        if data is not None and not data.empty:
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.droplevel(1)
+        if data is None or data.empty:
+            raise ValueError("Empty dataset received from data provider.")
             
-            # ডেটা ফ্রেশনেস বা টাইমস্ট্যাম্প লগ চেক
-            latest_time = data.index[-1]
-            logger.info(f"সফলভাবে যাচাইকৃত লাইভ ক্যান্ডেল টাইম: {latest_time}")
-            return data
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.droplevel(1)
+            
+        required_cols = ['Open', 'High', 'Low', 'Close']
+        for col in required_cols:
+            if col not in data.columns:
+                raise ValueError(f"Missing required column: {col}")
+                
+        # ডেটা ক্লিনিং এবং ডুপ্লিকেট রিমুভাল
+        data = data.dropna(subset=required_cols)
+        data = data[~data.index.duplicated(keep='last')]
+        data = data.sort_index()
+        
+        if len(data) < 30:
+            raise ValueError("Insufficient candles available for analysis.")
+            
+        # ডেটা ফ্রেশনেস যাচাই (শেষ ক্যান্ডেলটি খুব পুরোনো কি না)
+        latest_time = data.index[-1]
+        now_utc = datetime.now(timezone.utc)
+        
+        # যদি টাইমজোন অ্যাওয়ার না থাকে তবে হ্যান্ডেল করা
+        if latest_time.tzinfo is None:
+            latest_time = latest_time.tz_localize('UTC')
+            
+        time_diff = (now_utc - latest_time).total_seconds()
+        if time_diff > 300: # ৫ মিনিটের বেশি পুরোনো হলে ওয়ার্নিং/বাতিল
+            logger.warning(f"Market data is stale. Last candle timestamp: {latest_time}")
+            
+        with state_lock:
+            engine_state["last_data_timestamp"] = str(latest_time)
+            
+        return data
     except Exception as e:
-        logger.error(f"মার্কেট ডেটা ফেচ করতে ত্রুটি: {e}")
-    return None
+        err_msg = str(e)
+        logger.error(f"Data fetch error: {err_msg}")
+        with state_lock:
+            engine_state["last_error"] = err_msg
+        return None
 
-def calculate_indicators(df):
+def compute_indicators(df):
     """
-    EMA, RSI, MACD, Stochastic এবং ATR নিখুঁতভাবে ক্যালকুলেশন করা
+    EMA 8, 21, RSI 14, MACD (12, 26, 9), Stochastic (%K, %D), ATR 14 ক্যালকুলেশন।
     """
     close = df['Close']
     high = df['High']
     low = df['Low']
     
-    # ১. EMA (Exponential Moving Average)
+    # EMA
     df['EMA_Fast'] = close.ewm(span=8, adjust=False).mean()
     df['EMA_Slow'] = close.ewm(span=21, adjust=False).mean()
     
-    # ২. RSI (14 Period)
+    # RSI 14
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # ৩. MACD
+    # MACD 12, 26, 9
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df['MACD'] = ema12 - ema26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     
-    # ৪. Stochastic Oscillator
+    # Stochastic %K and %D
     low14 = low.rolling(window=14).min()
     high14 = high.rolling(window=14).max()
     df['Stoch_K'] = 100 * ((close - low14) / (high14 - low14 + 1e-10))
     df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
     
-    # ৫. ATR (Average True Range - Volatility Filter)
+    # ATR 14
     tr1 = high - low
     tr2 = (high - close.shift()).abs()
     tr3 = (low - close.shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     
-    return df
+    return df.dropna()
 
-def run_leakage_free_backtest(df):
+def leakage_free_backtest(df):
     """
-    ডেটা লিকেজ এড়িয়ে ঐতিহাসিক ডেটায় ব্যাকটেস্টিং এবং আসল উইন রেট হিসাব
+    ভবিষ্যতের ডেটা লিকেজ এড়িয়ে ঐতিহাসিক ডেটার ওপর ব্যাকটেস্ট করে প্রকৃত পারফরম্যান্স ও স্যাম্পল কাউন্ট বের করা।
     """
+    if len(df) < 30:
+        return 0.0, 0, 0, 0
+        
     df_bt = df.copy()
     df_bt['Signal'] = 0
     
-    # কঠোর এন্ট্রি শর্ত
-    buy_rule = (df_bt['EMA_Fast'] > df_bt['EMA_Slow']) & (df_bt['RSI'] < 48) & (df_bt['MACD_Hist'] > 0) & (df_bt['Stoch_K'] < 35)
-    sell_rule = (df_bt['EMA_Fast'] < df_bt['EMA_Slow']) & (df_bt['RSI'] > 52) & (df_bt['MACD_Hist'] < 0) & (df_bt['Stoch_K'] > 65)
+    # কঠোর কনফ্লুয়েন্স শর্ত
+    buy_cond = (df_bt['EMA_Fast'] > df_bt['EMA_Slow']) & (df_bt['RSI'] < 45) & (df_bt['MACD_Hist'] > 0) & (df_bt['Stoch_K'] < 30)
+    sell_cond = (df_bt['EMA_Fast'] < df_bt['EMA_Slow']) & (df_bt['RSI'] > 55) & (df_bt['MACD_Hist'] < 0) & (df_bt['Stoch_K'] > 70)
     
-    df_bt.loc[buy_rule, 'Signal'] = 1
-    df_bt.loc[sell_rule, 'Signal'] = -1
+    df_bt.loc[buy_cond, 'Signal'] = 1
+    df_bt.loc[sell_cond, 'Signal'] = -1
     
-    # ২ মিনিটের এক্সপাইরি অনুযায়ী ফিউচার শিফটিং (লিকেজ মুক্ত)
+    # ২ মিনিটের এক্সপায়ারির জন্য শিফটিং (ফিউচার রিটার্ন)
     df_bt['Future_Return'] = df_bt['Close'].shift(-2) - df_bt['Close']
     
-    executed = df_bt[df_bt['Signal'] != 0].dropna()
-    if len(executed) < 3:
-        return 98.6, len(executed)
+    executed = df_bt[df_bt['Signal'] != 0].dropna(subset=['Future_Return'])
+    total_samples = len(executed)
+    
+    if total_samples == 0:
+        return 0.0, 0, 0, 0
         
     executed['Win'] = ((executed['Signal'] == 1) & (executed['Future_Return'] > 0)) | \
                       ((executed['Signal'] == -1) & (executed['Future_Return'] < 0))
                       
-    total_samples = len(executed)
     wins = executed['Win'].sum()
-    win_rate = (wins / total_samples) * 100 if total_samples > 0 else 97.0
+    losses = total_samples - wins
+    win_rate = (wins / total_samples) * 100
     
-    return max(round(win_rate, 1), 95.0), total_samples
+    return round(win_rate, 1), total_samples, int(wins), int(losses)
 
-def generate_strict_real_signal():
-    df = fetch_strict_real_data()
-    
-    if df is None or len(df) < 30:
-        base_price = 1.1250
-        prices = np.random.normal(0.00004, 0.00025, 60) + base_price
-        df = pd.DataFrame({
-            'Open': prices,
-            'High': prices + 0.00015,
-            'Low': prices - 0.00015,
-            'Close': prices,
-            'Volume': 1500
-        })
+def generate_signal():
+    """
+    নিখুঁত অ্যানালাইসিস এবং স্কোরিং সিস্টেম। শর্ত পূরণ না হলে NO_SIGNAL রিটার্ন করবে।
+    """
+    df = fetch_market_data()
+    if df is None:
+        return None, "Data Unavailable"
         
-    df = calculate_indicators(df)
-    win_rate, sample_count = run_leakage_free_backtest(df)
+    df = compute_indicators(df)
+    if df.empty:
+        return None, "Insufficient Clean Data"
+        
+    win_rate, sample_count, bt_wins, bt_losses = leakage_free_backtest(df)
     
     latest = df.iloc[-1]
     price = float(latest['Close'])
@@ -200,7 +270,7 @@ def generate_strict_real_signal():
     ema_fast = float(latest['EMA_Fast'])
     ema_slow = float(latest['EMA_Slow'])
     
-    # কনফ্লুয়েন্স স্কোরিং
+    # কনফ্লুয়েন্স স্কোরিং সিস্টেম
     score = 0
     if ema_fast > ema_slow: score += 2
     else: score -= 2
@@ -211,139 +281,175 @@ def generate_strict_real_signal():
     if macd_hist > 0: score += 2
     else: score -= 2
     
-    if stoch_k < 30: score += 2
-    elif stoch_k > 70: score -= 2
+    if stoch_k < 35: score += 2
+    elif stoch_k > 65: score -= 2
     
-    # কঠোর শর্ত সাপেক্ষে ডিরেকশন ফিক্সড করা
+    # কঠোর থ্রেশহোল্ড (নাহলে সিগন্যাল বাতিল)
     if score >= 4:
         direction = "CALL 🟢 (HIGHER)"
     elif score <= -4:
         direction = "PUT 🔴 (LOWER)"
     else:
-        direction = "CALL 🟢 (HIGHER)" if ema_fast > ema_slow else "PUT 🔴 (LOWER)"
+        return None, "NO SIGNAL (Market in consolidation / low confluence)"
         
-    confidence = round(np.random.uniform(98.8, 99.9), 1)
-    
     analysis_text = (
-        f"📊 <b>Strict Real Analysis:</b>\n"
+        f"📊 <b>Technical Indicators:</b>\n"
         f"• RSI: <code>{rsi:.1f}</code> | MACD Hist: <code>{macd_hist:.4f}</code>\n"
-        f"• Stochastic %K: <code>{stoch_k:.1f}</code> | ATR: <code>{atr:.5f}</code>\n"
-        f"• Backtest WinRate: <code>{win_rate}%</code> (Samples: {sample_count})"
+        f"• Stoch %K: <code>{stoch_k:.1f}</code> | ATR: <code>{atr:.5f}</code>\n"
+        f"📈 <b>Out-of-Sample Backtest:</b> <code>{win_rate}%</code> (Wins: {bt_wins}, Losses: {bt_losses}, Samples: {sample_count})"
     )
     
-    return price, direction, f"{confidence}%", analysis_text
+    return {
+        "price": price,
+        "direction": direction,
+        "confidence": "Not calibrated (Live Out-of-Sample)",
+        "analysis": analysis_text
+    }, None
 
-def start_background_engine():
-    if not bot:
-        logger.error("টেলিগ্রাম বট টোকেন পাওয়া যায়নি!")
-        return
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    async def engine_loop():
-        global engine_running
-        logger.info("QUTEX Real Market Analysis Engine ব্যাকগ্রাউন্ডে চালু হয়েছে।")
+def evaluate_settlement(entry_price, direction, df_future):
+    """
+    প্রকৃত সেটেলমেন্ট যাচাই: এক্সপায়ারি শেষে প্রাইজ চেক করা।
+    """
+    try:
+        if df_future is None or df_future.empty:
+            return "UNKNOWN"
+        exit_price = float(df_future['Close'].iloc[-1])
         
-        session_signals = 0
-        session_wins = 0
-        session_losses = 0
-        session_start_time = asyncio.get_event_loop().time()
+        if "CALL" in direction:
+            if exit_price > entry_price: return "WIN"
+            elif exit_price < entry_price: return "LOSS"
+            else: return "DRAW"
+        elif "PUT" in direction:
+            if exit_price < entry_price: return "WIN"
+            elif exit_price > entry_price: return "LOSS"
+            else: return "DRAW"
+    except Exception:
+        pass
+    return "UNKNOWN"
 
-        while True:
-            try:
-                if not engine_running:
-                    await asyncio.sleep(2)
+def background_engine():
+    """
+    ব্যাকগ্রাউন্ডে নিরাপদে সিগন্যাল জেনারেট এবং এক্সপায়ারি ট্র্যাক করার লুপ।
+    """
+    global engine_state
+    logger.info("Background Signal Engine started.")
+    
+    while True:
+        try:
+            with state_lock:
+                is_running = engine_state["running"]
+                
+            if not is_running:
+                await_sleep = 5
+                # blocking sleep without async inside sync thread can use time.sleep
+                import time
+                time.sleep(5)
+                continue
+                
+            signal_data, error_reason = generate_signal()
+            
+            if signal_data is None:
+                logger.info(f"Signal skipped: {error_reason}")
+                with state_lock:
+                    engine_state["last_error"] = error_reason
+                import time
+                time.sleep(60) # ডেটা না থাকলে ১ মিনিট অপেক্ষা
+                continue
+                
+            asset = "EUR/USD (Live Market)"
+            expiry = "2 Minutes"
+            
+            with state_lock:
+                engine_state["total_signals"] += 1
+                engine_state["last_signal"] = f"{signal_data['direction']} at {signal_data['price']:.5f}"
+                engine_state["last_error"] = None
+                
+            signal_msg = (
+                f"⚡ <b>{PROJECT_NAME} SIGNAL</b> ⚡\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 <b>Asset:</b> <code>{asset}</code>\n"
+                f"💰 <b>Entry Price:</b> <code>{signal_data['price']:.5f}</code>\n"
+                f"📈 <b>Prediction:</b> <b>{signal_data['direction']}</b>\n"
+                f"⏳ <b>Expiry Time:</b> <code>{expiry}</code>\n"
+                f"🎯 <b>Confidence:</b> <code>{signal_data['confidence']}</code>\n"
+                f"{signal_data['analysis']}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👨‍💻 <b>Developer:</b> <b>{DEVELOPER_CREDIT}</b>\n"
+                f"⚠️ <i>Note: Quotex official settlement price may vary due to spread.</i>"
+            )
+            
+            if bot and TELEGRAM_CHAT_ID:
+                try:
+                    # Async loop runner for telegram bot
+                    async def send_msg():
+                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=signal_msg, parse_mode="HTML")
+                    asyncio.run(send_msg())
+                except TelegramError as te:
+                    logger.error(f"Telegram API Error: {te}")
+                    with state_lock:
+                        engine_state["last_error"] = f"Telegram Error: {te}"
+            
+            # ২ মিনিট (১২০ সেকেন্ড) ট্রেড মেয়াদের জন্য অপেক্ষা
+            import time
+            elapsed = 0
+            while elapsed < 120:
+                with state_lock:
+                    if not engine_state["running"]:
+                        break
+                time.sleep(1)
+                elapsed += 1
+                
+            with state_lock:
+                if not engine_state["running"]:
                     continue
-
-                price, direction, confidence, analysis_text = generate_strict_real_signal()
-                
-                if not engine_running:
-                    await asyncio.sleep(2)
-                    continue
-
-                asset = "EUR/USD (Real-Market Verified)"
-                expiry = "2 Minutes"  # সুনির্দিষ্ট ২ মিনিট এক্সপাইরি
-                
-                session_signals += 1
-                
-                signal_message = (
-                    f"⚡ <b>QUTEX STRICT REAL SIGNAL</b> ⚡\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 <b>Asset:</b> <code>{asset}</code>\n"
-                    f"💰 <b>Real Entry Price:</b> <code>{price:.5f}</code>\n"
-                    f"📈 <b>Prediction:</b> <b>{direction}</b>\n"
-                    f"⏳ <b>Expiry Time:</b> <code>{expiry}</code>\n"
-                    f"🎯 <b>Confidence Score:</b> <code>{confidence}</code>\n"
-                    f"{analysis_text}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👨‍💻 <b>Developer & Engine Core:</b> <b>{DEVELOPER_CREDIT}</b>\n"
-                    f"⚠️ <i>Trade securely at your own risk.</i>"
-                )
-                
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=signal_message, parse_mode="HTML")
-                logger.info(f"রিয়েল মার্কেট সিগন্যাল #{session_signals} পাঠানো হয়েছে।")
-                
-                # ২ মিনিট (১২০ সেকেন্ড) ট্রেড মেয়াদের জন্য অপেক্ষা
-                for _ in range(120):
-                    if not engine_running: break
-                    await asyncio.sleep(1)
-
-                if not engine_running: continue
-                
-                is_win = np.random.choice([True, True, True, True, True, True, True, True, True, False])
-                if is_win:
-                    session_wins += 1
-                    result_status = "WIN ✅ (In-The-Money)"
-                else:
-                    session_losses += 1
-                    result_status = "LOSS ❌"
-                
-                result_message = (
-                    f"📊 <b>QUTEX SETTLEMENT RESULT</b> 📊\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🏷 <b>Asset:</b> <code>{asset}</code>\n"
-                    f"🏁 <b>Status:</b> <b>{result_status}</b>\n"
-                    f"📈 <b>Market Accuracy:</b> 99.8% Verified\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👨‍💻 <b>Developer & Powered By:</b> <b>{DEVELOPER_CREDIT}</b>"
-                )
-                
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=result_message, parse_mode="HTML")
-                logger.info("সেটেলমেন্ট রেজাল্ট পাঠানো হয়েছে।")
-                
-                for _ in range(60):
-                    if not engine_running: break
-                    await asyncio.sleep(1)
-
-                current_time = asyncio.get_event_loop().time()
-                if current_time - session_start_time >= 1200:
-                    win_rate = (session_wins / session_signals * 100) if session_signals > 0 else 0
-                    summary_message = (
-                        f"📊📈 <b>20-MIN PERFORMANCE SUMMARY</b> 📈📊\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"🎯 <b>Total Signals:</b> <code>{session_signals}</code>\n"
-                        f"✅ <b>Total Wins:</b> <code>{session_wins}</code>\n"
-                        f"❌ <b>Total Losses:</b> <code>{session_losses}</code>\n"
-                        f"⭐ <b>Win Rate:</b> <code>{win_rate:.1f}%</code>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"👨‍💻 <b>Powered By:</b> <b>{DEVELOPER_CREDIT}</b>"
-                    )
-                    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=summary_message, parse_mode="HTML")
-                    logger.info("২০ মিনিটের পারফরম্যান্স সামারি পাঠানো হয়েছে।")
                     
-                    session_signals = 0
-                    session_wins = 0
-                    session_losses = 0
-                    session_start_time = current_time
+            # সেটেলমেন্ট যাচাই
+            future_df = fetch_market_data()
+            result_status = evaluate_settlement(signal_data['price'], signal_data['direction'], future_df)
+            
+            with state_lock:
+                if result_status == "WIN":
+                    engine_state["wins"] += 1
+                    res_display = "WIN ✅"
+                elif result_status == "LOSS":
+                    engine_state["losses"] += 1
+                    res_display = "LOSS ❌"
+                elif result_status == "DRAW":
+                    engine_state["draws"] += 1
+                    res_display = "DRAW ➖"
+                else:
+                    res_display = "UNKNOWN ⚠️"
+                    
+            result_msg = (
+                f"📊 <b>SETTLEMENT RESULT</b> 📊\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏷 <b>Asset:</b> <code>{asset}</code>\n"
+                f"🏁 <b>Status:</b> <b>{res_display}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👨‍💻 <b>{DEVELOPER_CREDIT}</b>"
+            )
+            
+            if bot and TELEGRAM_CHAT_ID and result_status != "UNKNOWN":
+                try:
+                    async def send_res():
+                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=result_msg, parse_mode="HTML")
+                    asyncio.run(send_res())
+                except Exception as ex:
+                    logger.error(f"Result notification error: {ex}")
+                    
+            time.sleep(30) # পরবর্তী সিগন্যালের আগে বিরতি
+            
+        except Exception as ex:
+            logger.error(f"Critical error in background engine: {ex}")
+            with state_lock:
+                engine_state["last_error"] = str(ex)
+            import time
+            time.sleep(15)
 
-            except Exception as e:
-                logger.error(f"ইঞ্জিন লুপে ত্রুটি: {e}")
-                await asyncio.sleep(15)
-
-    loop.run_until_complete(engine_loop())
-
-threading.Thread(target=start_background_engine, daemon=True).start()
+# Background Thread Launch (Single Worker architecture recommendation)
+if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or os.environ.get("RENDER"):
+    engine_thread = threading.Thread(target=background_engine, daemon=True)
+    engine_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
