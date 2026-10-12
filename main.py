@@ -78,7 +78,7 @@ HTML_TEMPLATE = """
         <div class="subtitle">Developer: {{ developer }}</div>
         
         <div class="status-badge {{ 'running' if state.running else 'stopped' }}">
-            {{ '🟢 Engine Status: RUNNING (Pure Python yfinance)' if state.running else '🔴 Engine Status: STOPPED' }}
+            {{ '🟢 Engine Status: RUNNING (Instant Signals)' if state.running else '🔴 Engine Status: STOPPED' }}
         </div>
         
         <div class="info-box">
@@ -124,8 +124,7 @@ def control():
 
 def fetch_market_data():
     """
-    yfinance লাইব্রেরি ব্যবহার করে পাইথনের মাধ্যমে সরাসরি EUR/USD লাইভ ডেটা ফেচ করা।
-    কোনো সিন্থেটিক বা ভুয়া ডেটা তৈরি করা হয় না।
+    yfinance লাইব্রেরি ব্যবহার করে EUR/USD লাইভ ডেটা ফেচ করা।
     """
     try:
         ticker = yf.Ticker("EURUSD=X")
@@ -164,31 +163,26 @@ def compute_indicators(df):
     high = df['High']
     low = df['Low']
     
-    # EMA 8 & 21
     df['EMA_Fast'] = close.ewm(span=8, adjust=False).mean()
     df['EMA_Slow'] = close.ewm(span=21, adjust=False).mean()
     
-    # RSI 14
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # MACD 12, 26, 9
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df['MACD'] = ema12 - ema26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     
-    # Stochastic %K and %D
     low14 = low.rolling(window=14).min()
     high14 = high.rolling(window=14).max()
     df['Stoch_K'] = 100 * ((close - low14) / (high14 - low14 + 1e-10))
     df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
     
-    # ATR 14
     tr1 = high - low
     tr2 = (high - close.shift()).abs()
     tr3 = (low - close.shift()).abs()
@@ -204,8 +198,9 @@ def leakage_free_backtest(df):
     df_bt = df.copy()
     df_bt['Signal'] = 0
     
-    buy_cond = (df_bt['EMA_Fast'] > df_bt['EMA_Slow']) & (df_bt['RSI'] < 45) & (df_bt['MACD_Hist'] > 0) & (df_bt['Stoch_K'] < 30)
-    sell_cond = (df_bt['EMA_Fast'] < df_bt['EMA_Slow']) & (df_bt['RSI'] > 55) & (df_bt['MACD_Hist'] < 0) & (df_bt['Stoch_K'] > 70)
+    # ব্যাকটেস্টিংয়ের জন্য সাধারণ শর্ত
+    buy_cond = df_bt['EMA_Fast'] >= df_bt['EMA_Slow']
+    sell_cond = df_bt['EMA_Fast'] < df_bt['EMA_Slow']
     
     df_bt.loc[buy_cond, 'Signal'] = 1
     df_bt.loc[sell_cond, 'Signal'] = -1
@@ -247,25 +242,11 @@ def generate_signal():
     ema_fast = float(latest['EMA_Fast'])
     ema_slow = float(latest['EMA_Slow'])
     
-    score = 0
-    if ema_fast > ema_slow: score += 2
-    else: score -= 2
-    
-    if rsi < 45: score += 2
-    elif rsi > 55: score -= 2
-    
-    if macd_hist > 0: score += 2
-    else: score -= 2
-    
-    if stoch_k < 35: score += 2
-    elif stoch_k > 65: score -= 2
-    
-    if score >= 4:
+    # কোনো নো-সিগন্যাল ফিল্টার ছাড়াই তাৎক্ষণিক ডিরেকশন নির্ধারণ
+    if ema_fast >= ema_slow:
         direction = "CALL 🟢 (HIGHER)"
-    elif score <= -4:
-        direction = "PUT 🔴 (LOWER)"
     else:
-        return None, f"NO SIGNAL (Score: {score}/4 - Confluence not met)"
+        direction = "PUT 🔴 (LOWER)"
         
     analysis_text = (
         f"📊 <b>Technical Indicators:</b>\n"
@@ -301,7 +282,7 @@ def evaluate_settlement(entry_price, direction, df_future):
 
 def background_engine():
     global engine_state
-    logger.info("Background Signal Engine started with Pure Python yfinance.")
+    logger.info("Background Signal Engine started (No-Filter Instant Mode).")
     
     while True:
         try:
@@ -315,13 +296,13 @@ def background_engine():
             signal_data, error_reason = generate_signal()
             
             if signal_data is None:
-                logger.info(f"Signal skipped: {error_reason}")
+                logger.info(f"Signal skipped due to data issue: {error_reason}")
                 with state_lock:
                     engine_state["last_error"] = error_reason
-                time.sleep(60)
+                time.sleep(15)
                 continue
                 
-            asset = "EUR/USD (Pure Python Live)"
+            asset = "EUR/USD (Instant Live)"
             expiry = "2 Minutes"
             
             with state_lock:
@@ -353,7 +334,7 @@ def background_engine():
                     with state_lock:
                         engine_state["last_error"] = f"Telegram Error: {te}"
             
-            # ২ মিনিট (১২০ সেকেন্ড) ট্রেড মেয়াদের জন্য অপেক্ষা
+            # ২ মিনিট (১২০ সেকেন্ড) অপেক্ষা
             elapsed = 0
             while elapsed < 120:
                 with state_lock:
@@ -363,8 +344,8 @@ def background_engine():
                 elapsed += 1
                 
             with state_lock:
-                if not engine_running if 'engine_running' in globals() else not engine_state["running"]:
-                    pass
+                if not engine_state["running"]:
+                    continue
                     
             future_df = fetch_market_data()
             result_status = evaluate_settlement(signal_data['price'], signal_data['direction'], future_df)
@@ -399,13 +380,13 @@ def background_engine():
                 except Exception as ex:
                     logger.error(f"Result notification error: {ex}")
                     
-            time.sleep(30)
+            time.sleep(10) # দ্রুত পরবর্তী সিগন্যালের জন্য বিরতি কমানো হয়েছে
             
         except Exception as ex:
             logger.error(f"Critical error in background engine: {ex}")
             with state_lock:
                 engine_state["last_error"] = str(ex)
-            time.sleep(15)
+            time.sleep(10)
 
 if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or os.environ.get("RENDER"):
     engine_thread = threading.Thread(target=background_engine, daemon=True)
