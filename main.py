@@ -2,13 +2,14 @@ import os
 import logging
 import asyncio
 import threading
+import time
 from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, redirect, url_for
 from telegram import Bot
 from telegram.error import TelegramError
 import pandas as pd
 import numpy as np
-import requests
+import yfinance as yf
 
 # Logging Setup
 logging.basicConfig(
@@ -22,7 +23,6 @@ app = Flask(__name__)
 # Credentials & Constants
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@qutexsignalcth")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 DEVELOPER_CREDIT = "@SHADOW_JOKER_CTH"
 PROJECT_NAME = "Qutex Signal CTH"
 
@@ -34,7 +34,6 @@ engine_state = {
     "last_signal": None,
     "last_error": None,
     "last_data_timestamp": "Not Available",
-    "active_signals_count": 0,
     "total_signals": 0,
     "wins": 0,
     "losses": 0,
@@ -79,7 +78,7 @@ HTML_TEMPLATE = """
         <div class="subtitle">Developer: {{ developer }}</div>
         
         <div class="status-badge {{ 'running' if state.running else 'stopped' }}">
-            {{ '🟢 Engine Status: RUNNING (RapidAPI Connected)' if state.running else '🔴 Engine Status: STOPPED' }}
+            {{ '🟢 Engine Status: RUNNING (Pure Python yfinance)' if state.running else '🔴 Engine Status: STOPPED' }}
         </div>
         
         <div class="info-box">
@@ -125,59 +124,37 @@ def control():
 
 def fetch_market_data():
     """
-    RapidAPI YH Finance Chart Endpoint ব্যবহার করে EUR/USD লাইভ ডেটা ফেচ করা।
+    yfinance লাইব্রেরি ব্যবহার করে পাইথনের মাধ্যমে সরাসরি EUR/USD লাইভ ডেটা ফেচ করা।
+    কোনো সিন্থেটিক বা ভুয়া ডেটা তৈরি করা হয় না।
     """
     try:
-        if not RAPIDAPI_KEY:
-            raise ValueError("RAPIDAPI_KEY is missing in environment variables.")
-
-        url = "https://yh-finance.p.rapidapi.com/stock/v2/get-chart"
-        querystring = {"symbol": "EURUSD=X", "interval": "1m", "range": "1d"}
-        headers = {
-            "X-RapidAPI-Key": RAPIDAPI_KEY,
-            "X-RapidAPI-Host": "yh-finance.p.rapidapi.com"
-        }
-
-        response = requests.get(url, headers=headers, params=querystring, timeout=15)
-        if response.status_code != 200:
-            raise ValueError(f"RapidAPI HTTP Error: {response.status_code}")
-
-        res_json = response.json()
-        result = res_json.get("chart", {}).get("result", [])
-        if not result:
-            raise ValueError("Invalid chart result structure from RapidAPI.")
-
-        data_res = result[0]
-        timestamps = data_res.get("timestamp", [])
-        indicators = data_res.get("indicators", {}).get("quote", [{}])[0]
-
-        if not timestamps or not indicators:
-            raise ValueError("Missing timestamps or quote indicators in API response.")
-
-        df = pd.DataFrame({
-            "Open": indicators.get("open", []),
-            "High": indicators.get("high", []),
-            "Low": indicators.get("low", []),
-            "Close": indicators.get("close", []),
-            "Volume": indicators.get("volume", [0] * len(timestamps))
-        }, index=pd.to_datetime(timestamps, unit="s", utc=True))
-
-        df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
-        df = df[~df.index.duplicated(keep='last')]
-        df = df.sort_index()
-
-        if len(df) < 30:
-            raise ValueError(f"Insufficient candles ({len(df)}). Need at least 30.")
-
-        latest_time = df.index[-1]
+        ticker = yf.Ticker("EURUSD=X")
+        data = ticker.history(period="1d", interval="1m")
+        
+        if data is None or data.empty:
+            raise ValueError("Empty dataset received from yfinance.")
+            
+        required_cols = ['Open', 'High', 'Low', 'Close']
+        for col in required_cols:
+            if col not in data.columns:
+                raise ValueError(f"Missing required column: {col}")
+                
+        data = data.dropna(subset=required_cols)
+        data = data[~data.index.duplicated(keep='last')]
+        data = data.sort_index()
+        
+        if len(data) < 30:
+            raise ValueError(f"Insufficient candles ({len(data)}). Need at least 30.")
+            
+        latest_time = data.index[-1]
         with state_lock:
             engine_state["last_data_timestamp"] = str(latest_time)
             engine_state["last_error"] = None
-
-        return df
+            
+        return data
     except Exception as e:
         err_msg = str(e)
-        logger.error(f"RapidAPI fetch error: {err_msg}")
+        logger.error(f"yfinance fetch error: {err_msg}")
         with state_lock:
             engine_state["last_error"] = err_msg
         return None
@@ -187,26 +164,31 @@ def compute_indicators(df):
     high = df['High']
     low = df['Low']
     
+    # EMA 8 & 21
     df['EMA_Fast'] = close.ewm(span=8, adjust=False).mean()
     df['EMA_Slow'] = close.ewm(span=21, adjust=False).mean()
     
+    # RSI 14
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-10)
     df['RSI'] = 100 - (100 / (1 + rs))
     
+    # MACD 12, 26, 9
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df['MACD'] = ema12 - ema26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     
+    # Stochastic %K and %D
     low14 = low.rolling(window=14).min()
     high14 = high.rolling(window=14).max()
     df['Stoch_K'] = 100 * ((close - low14) / (high14 - low14 + 1e-10))
     df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
     
+    # ATR 14
     tr1 = high - low
     tr2 = (high - close.shift()).abs()
     tr3 = (low - close.shift()).abs()
@@ -248,7 +230,7 @@ def leakage_free_backtest(df):
 def generate_signal():
     df = fetch_market_data()
     if df is None:
-        return None, "RapidAPI Data Unavailable or Key Missing"
+        return None, "Market Data Unavailable"
         
     df = compute_indicators(df)
     if df.empty:
@@ -319,9 +301,8 @@ def evaluate_settlement(entry_price, direction, df_future):
 
 def background_engine():
     global engine_state
-    logger.info("Background Signal Engine started with RapidAPI.")
+    logger.info("Background Signal Engine started with Pure Python yfinance.")
     
-    import time
     while True:
         try:
             with state_lock:
@@ -340,7 +321,7 @@ def background_engine():
                 time.sleep(60)
                 continue
                 
-            asset = "EUR/USD (RapidAPI Live)"
+            asset = "EUR/USD (Pure Python Live)"
             expiry = "2 Minutes"
             
             with state_lock:
@@ -372,18 +353,18 @@ def background_engine():
                     with state_lock:
                         engine_state["last_error"] = f"Telegram Error: {te}"
             
-            # ২ মিনিট (১২০ সেকেন্ড) অপেক্ষা
+            # ২ মিনিট (১২০ সেকেন্ড) ট্রেড মেয়াদের জন্য অপেক্ষা
             elapsed = 0
             while elapsed < 120:
                 with state_lock:
-                    if not engine_running:
+                    if not engine_state["running"]:
                         break
                 time.sleep(1)
                 elapsed += 1
                 
             with state_lock:
-                if not engine_running:
-                    continue
+                if not engine_running if 'engine_running' in globals() else not engine_state["running"]:
+                    pass
                     
             future_df = fetch_market_data()
             result_status = evaluate_settlement(signal_data['price'], signal_data['direction'], future_df)
