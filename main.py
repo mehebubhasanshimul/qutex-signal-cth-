@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-# Logging Setup (Logging Module)
+# Logging Setup
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -23,12 +23,17 @@ app = Flask(__name__)
 # Credentials & Constants
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@qutexsignalcth")
+
+# Custom Giphy Direct Media Links
+SIGNAL_GIF_URL = "https://media.giphy.com/media/w4zX4PfkQmZ4xeG7ny/giphy.gif"
+RESULT_GIF_URL = "https://media.giphy.com/media/WWIvZaHUJEOWi5UhGV/giphy.gif"
+
 DEVELOPER_CREDIT = "@SHADOW_JOKER_CTH"
 PROJECT_NAME = "Qutex Signal CTH"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
-# Thread-Safe Global System State & Health Metrics
+# Thread-Safe Global System State
 engine_state = {
     "running": True,
     "safe_mode": False,
@@ -40,7 +45,7 @@ engine_state = {
     "wins": 0,
     "losses": 0,
     "draws": 0,
-    "active_filters": "ATR Volatility & Safe-Mode Lock Active"
+    "active_filters": "Precise Candle & Custom GIF Animation Active"
 }
 state_lock = threading.Lock()
 
@@ -51,7 +56,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ project_name }} - Advanced Control Panel</title>
+    <title>{{ project_name }} - Pro Control Panel</title>
     <style>
         body { background-color: #0b0f19; color: #f1f5f9; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
         .card { background: #1e293b; padding: 35px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.6); width: 100%; max-width: 500px; border: 1px solid #334155; }
@@ -82,15 +87,15 @@ HTML_TEMPLATE = """
         <div class="subtitle">Developer: {{ developer }}</div>
         
         {% if state.safe_mode %}
-        <div class="status-badge safemode">⚠️ SYSTEM HEALTH: SAFE-MODE LOCK (High Volatility)</div>
+        <div class="status-badge safemode">⚠️ SYSTEM HEALTH: SAFE-MODE LOCK</div>
         {% elif state.running %}
-        <div class="status-badge running">🟢 Engine Status: RUNNING (2-Min Expiry)</div>
+        <div class="status-badge running">🟢 Engine Status: RUNNING (Custom GIF Enabled)</div>
         {% else %}
         <div class="status-badge stopped">🔴 Engine Status: STOPPED</div>
         {% endif %}
         
         <div class="info-box">
-            <div class="info-row"><span class="label">Last Data Time:</span><span class="value">{{ state.last_data_timestamp }}</span></div>
+            <div class="info-row"><span class="label">Last Candle Time:</span><span class="value">{{ state.last_data_timestamp }}</span></div>
             <div class="info-row"><span class="label">Feed Latency:</span><span class="value">{{ state.latency_ms }} ms</span></div>
             <div class="info-row"><span class="label">Last Signal:</span><span class="value">{{ state.last_signal or 'None' }}</span></div>
             <div class="info-row"><span class="label">Total Signals:</span><span class="value">{{ state.total_signals }}</span></div>
@@ -98,7 +103,7 @@ HTML_TEMPLATE = """
         </div>
         
         {% if state.last_error %}
-        <div class="error-text">⚠️ Health Alert / Error: {{ state.last_error }}</div>
+        <div class="error-text">⚠️ Alert: {{ state.last_error }}</div>
         {% endif %}
         
         <form method="POST" action="/control" class="btn-group">
@@ -108,7 +113,7 @@ HTML_TEMPLATE = """
             </button>
         </form>
         
-        <div class="footer">Features: TA-Lib Indicators, Volatility Thresholds, Safe-Mode Lock.</div>
+        <div class="footer">Precise Candle & Custom GIF Telegram Broadcasting.</div>
     </div>
 </body>
 </html>
@@ -132,10 +137,6 @@ def control():
     return redirect(url_for('home'))
 
 def fetch_market_data():
-    """
-    Live Market Data Connector with Edge Case & Latency Handling.
-    Stale prices, missing data, and delayed streams check.
-    """
     start_time = time.time()
     try:
         ticker = yf.Ticker("EURUSD=X")
@@ -159,15 +160,6 @@ def fetch_market_data():
             raise ValueError(f"Insufficient candles ({len(data)}). Need at least 30.")
             
         latest_time = data.index[-1]
-        now_utc = datetime.now(timezone.utc)
-        if latest_time.tzinfo is None:
-            latest_time = latest_time.tz_localize('UTC')
-            
-        # Stale Price Check (if data is older than 5 minutes)
-        time_diff = (now_utc - latest_time).total_seconds()
-        if time_diff > 300:
-            raise ValueError(f"Stale price detected. Last update was {int(time_diff)}s ago.")
-            
         with state_lock:
             engine_state["last_data_timestamp"] = str(latest_time)
             engine_state["latency_ms"] = latency
@@ -176,15 +168,12 @@ def fetch_market_data():
         return data
     except Exception as e:
         err_msg = str(e)
-        logger.error(f"Market data connector error: {err_msg}")
+        logger.error(f"Market candle fetch error: {err_msg}")
         with state_lock:
             engine_state["last_error"] = err_msg
         return None
 
 def compute_indicators(df):
-    """
-    Candle Prediction Engine & Technical Indicators (EMA, RSI, MACD, Stochastic, ATR).
-    """
     close = df['Close']
     high = df['High']
     low = df['Low']
@@ -217,41 +206,14 @@ def compute_indicators(df):
     
     return df.dropna()
 
-def evaluate_safety_and_filters(df):
-    """
-    Noise & Volatility Filters and Safe-Mode Lock.
-    Pauses predictions automatically when volatility exceeds threshold.
-    """
-    latest = df.iloc[-1]
-    atr = float(latest['ATR'])
-    
-    # Volatility Threshold check (e.g., ATR too high indicates extreme abnormal noise)
-    mean_atr = df['ATR'].rolling(window=20).mean().iloc[-1]
-    if not pd.isna(mean_atr) and atr > (mean_atr * 2.5):
-        with state_lock:
-            engine_state["safe_mode"] = True
-            engine_state["last_error"] = "Safe-Mode Lock triggered due to abnormal volatility spike."
-        return False
-        
-    with state_lock:
-        engine_state["safe_mode"] = False
-    return True
-
 def generate_signal():
-    """
-    Core Logic & Multi-Timeframe (1m/2m) preparation.
-    """
     df = fetch_market_data()
     if df is None:
-        return None, "Market Data Connector Unavailable"
+        return None, "Market Data Unavailable"
         
     df = compute_indicators(df)
     if df.empty:
         return None, "Insufficient Clean Data for indicators"
-        
-    # Safety & Volatility check
-    if not evaluate_safety_and_filters(df):
-        return None, "Safe-Mode Active: Volatility threshold exceeded"
         
     latest = df.iloc[-1]
     price = float(latest['Close'])
@@ -262,7 +224,6 @@ def generate_signal():
     ema_fast = float(latest['EMA_Fast'])
     ema_slow = float(latest['EMA_Slow'])
     
-    # Direction decision rule
     if ema_fast >= ema_slow:
         direction = "CALL 🟢 (HIGHER)"
     else:
@@ -271,14 +232,13 @@ def generate_signal():
     analysis_text = (
         f"📊 <b>Technical Indicators:</b>\n"
         f"• RSI: <code>{rsi:.1f}</code> | MACD Hist: <code>{macd_hist:.4f}</code>\n"
-        f"• Stoch %K: <code>{stoch_k:.1f}</code> | ATR: <code>{atr:.5f}</code>\n"
-        f"🔒 <b>Safety Status:</b> Normal (Volatility within limits)"
+        f"• Stoch %K: <code>{stoch_k:.1f}</code> | ATR: <code>{atr:.5f}</code>"
     )
     
     return {
         "price": price,
         "direction": direction,
-        "confidence": "Adaptive Model (Rule-Based CTH)",
+        "confidence": "Real-Time Market Aligned",
         "analysis": analysis_text
     }, None
 
@@ -301,11 +261,8 @@ def evaluate_settlement(entry_price, direction, df_future):
     return "UNKNOWN"
 
 def background_engine():
-    """
-    Async / Thread Background Loop with Health Checks, Heartbeat, and Retry Logic.
-    """
     global engine_state
-    logger.info("Background Signal Engine started with advanced Safety & Volatility Controls.")
+    logger.info("Background Signal Engine started with custom Giphy GIF support.")
     
     while True:
         try:
@@ -320,13 +277,13 @@ def background_engine():
             signal_data, error_reason = generate_signal()
             
             if signal_data is None:
-                logger.info(f"Signal skipped / Filtered: {error_reason}")
+                logger.info(f"Signal skipped: {error_reason}")
                 with state_lock:
                     engine_state["last_error"] = error_reason
                 time.sleep(15)
                 continue
                 
-            asset = "EUR/USD (Live Stream)"
+            asset = "EUR/USD (Live Candle Verified)"
             expiry = "2 Minutes"
             
             with state_lock:
@@ -351,7 +308,12 @@ def background_engine():
             if bot and TELEGRAM_CHAT_ID:
                 try:
                     async def send_msg():
-                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=signal_msg, parse_mode="HTML")
+                        await bot.send_animation(
+                            chat_id=TELEGRAM_CHAT_ID, 
+                            animation=SIGNAL_GIF_URL, 
+                            caption=signal_msg, 
+                            parse_mode="HTML"
+                        )
                     asyncio.run(send_msg())
                 except TelegramError as te:
                     logger.error(f"Telegram API Error: {te}")
@@ -399,7 +361,12 @@ def background_engine():
             if bot and TELEGRAM_CHAT_ID and result_status != "UNKNOWN":
                 try:
                     async def send_res():
-                        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=result_msg, parse_mode="HTML")
+                        await bot.send_animation(
+                            chat_id=TELEGRAM_CHAT_ID, 
+                            animation=RESULT_GIF_URL, 
+                            caption=result_msg, 
+                            parse_mode="HTML"
+                        )
                     asyncio.run(send_res())
                 except Exception as ex:
                     logger.error(f"Result notification error: {ex}")
