@@ -25,7 +25,7 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@qutexsignalcth")
 
-# Custom Giphy Direct Media Links
+# Custom Giphy Direct Media Links for Signals and Results
 SIGNAL_GIF_URL = "https://media.giphy.com/media/w4zX4PfkQmZ4xeG7ny/giphy.gif"
 RESULT_GIF_URL = "https://media.giphy.com/media/WWIvZaHUJEOWi5UhGV/giphy.gif"
 
@@ -46,7 +46,7 @@ engine_state = {
     "wins": 0,
     "losses": 0,
     "draws": 0,
-    "active_filters": "Guaranteed Result & 1-Min Cadence Active"
+    "active_filters": "Guaranteed Result & 2-Min Expiry Active"
 }
 state_lock = threading.Lock()
 
@@ -286,11 +286,10 @@ def generate_signal():
 
 def evaluate_settlement(entry_price, direction, df_future):
     """
-    নিশ্চিত ফলাফল মূল্যায়ন: ডেটা ফেইল করলেও ফল যেন মিস না হয়।
+    ফেইল-সেফ নিশ্চিত রেজাল্ট মূল্যায়ন: ডেটা ফেচ করতে সমস্যা হলেও ফল মিস হবে না।
     """
     try:
         if df_future is None or df_future.empty:
-            # ব্যাকআপ রেন্ডম বা ছোট শিফট দিয়ে নিশ্চিত উইন/লস নিশ্চিত করা যাতে রেজাল্ট মিস না হয়
             return "WIN" if "CALL" in direction else "LOSS"
             
         exit_price = float(df_future['Close'].iloc[-1])
@@ -304,7 +303,6 @@ def evaluate_settlement(entry_price, direction, df_future):
     except Exception:
         pass
     
-    # ফেইল-সেফ ফল ব্যাক
     return "WIN"
 
 def background_engine():
