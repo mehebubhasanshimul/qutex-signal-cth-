@@ -2,12 +2,17 @@ services:
   - type: web
     name: qutex-signal-cth
     env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 1 --threads 2 --timeout 120
+    startCommand: gunicorn main:app --workers 1 --threads 4 --timeout 120
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.0
+        value: 3.10.12
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         value: "@qutexsignalcth"
+      - key: CONTROL_SECRET
+        sync: false
+      - key: BINANCE_SYMBOL
+        value: BTCUSDT
